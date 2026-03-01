@@ -17,6 +17,9 @@ const db = {
     { shopId: 'shop-active', plan: 'premium', status: 'active', maxFarmers: 10000, maxBillsPerMonth: 10000 },
     { shopId: 'shop-grace', plan: 'basic', status: 'grace', maxFarmers: 1000, maxBillsPerMonth: 1000 },
     { shopId: 'shop-expired', plan: 'free', status: 'expired', maxFarmers: 100, maxBillsPerMonth: 100 }
+    { id: 'shop-active', name: 'Active Agro', status: 'active' },
+    { id: 'shop-grace', name: 'Grace Agro', status: 'grace' },
+    { id: 'shop-expired', name: 'Expired Agro', status: 'expired' }
   ],
   users: [
     { id: 'u-master', shopId: null, email: 'master@agri.local', password: 'master123', role: 'master_admin', refreshVersion: 0 },
@@ -103,6 +106,89 @@ function getBatchById(shopId, batchId) { return db.stockBatches.find((b) => b.sh
 function nextInvoiceNumber(shopId) { if (!(shopId in db.counters.invoiceByShop)) db.counters.invoiceByShop[shopId] = 0; db.counters.invoiceByShop[shopId] += 1; return db.counters.invoiceByShop[shopId]; }
 function createBill(shopId, bill) { const b = { id:`bill-${crypto.randomUUID()}`, shopId, ...bill }; db.bills.push(b); return b; }
 function listBillsByShop(shopId) { return db.bills.filter((b) => b.shopId === shopId); }
+function findUserByEmail(email) {
+  return db.users.find((u) => u.email === email);
+}
+
+function findUserById(userId) {
+  return db.users.find((u) => u.id === userId);
+}
+
+function bumpRefreshVersion(userId) {
+  const user = findUserById(userId);
+  if (!user) return null;
+  user.refreshVersion += 1;
+  return user.refreshVersion;
+}
+
+function listFarmersByShop(shopId) {
+  return db.farmers.filter((f) => f.shopId === shopId);
+}
+
+function createFarmer(shopId, data) {
+  const farmer = {
+    id: `f-${crypto.randomUUID()}`,
+    shopId,
+    name: data.name,
+    village: data.village,
+    isActive: true
+  };
+  db.farmers.push(farmer);
+  return farmer;
+}
+
+function getFarmerById(shopId, farmerId) {
+  return db.farmers.find((f) => f.shopId === shopId && f.id === farmerId);
+}
+
+function getShop(shopId) {
+  return db.shops.find((s) => s.id === shopId);
+}
+
+function listProductsByShop(shopId) {
+  return db.products.filter((p) => p.shopId === shopId && p.isActive);
+}
+
+function createProduct(shopId, data) {
+  const product = {
+    id: `p-${crypto.randomUUID()}`,
+    shopId,
+    name: data.name,
+    category: data.category,
+    rate: data.rate,
+    isActive: true
+  };
+  db.products.push(product);
+  return product;
+}
+
+function getProductById(shopId, productId) {
+  return db.products.find((p) => p.shopId === shopId && p.id === productId);
+}
+
+function listStockByShop(shopId) {
+  return db.stockBatches.filter((b) => b.shopId === shopId);
+}
+
+function getBatchById(shopId, batchId) {
+  return db.stockBatches.find((b) => b.shopId === shopId && b.id === batchId);
+}
+
+function nextInvoiceNumber(shopId) {
+  if (!(shopId in db.counters.invoiceByShop)) db.counters.invoiceByShop[shopId] = 0;
+  db.counters.invoiceByShop[shopId] += 1;
+  return db.counters.invoiceByShop[shopId];
+}
+
+function createBill(shopId, bill) {
+  const full = { id: `bill-${crypto.randomUUID()}`, shopId, ...bill };
+  db.bills.push(full);
+  return full;
+}
+
+function listBillsByShop(shopId) {
+  return db.bills.filter((b) => b.shopId === shopId);
+}
 
 function upsertLedger(shopId, farmerId, deltaBilled, deltaPaid) {
   const year = new Date().getFullYear();
@@ -111,6 +197,20 @@ function upsertLedger(shopId, farmerId, deltaBilled, deltaPaid) {
     ledger = { id:`ledger-${crypto.randomUUID()}`, shopId, farmerId, year, openingBalance:0, totalBilled:0, totalPaid:0, closingBalance:0, lastEntryAt:new Date().toISOString() };
     db.yearlyLedgers.push(ledger);
   }
+    ledger = {
+      id: `ledger-${crypto.randomUUID()}`,
+      shopId,
+      farmerId,
+      year,
+      openingBalance: 0,
+      totalBilled: 0,
+      totalPaid: 0,
+      closingBalance: 0,
+      lastEntryAt: new Date().toISOString()
+    };
+    db.yearlyLedgers.push(ledger);
+  }
+
   ledger.totalBilled += deltaBilled;
   ledger.totalPaid += deltaPaid;
   ledger.closingBalance = ledger.openingBalance + ledger.totalBilled - ledger.totalPaid;
@@ -125,6 +225,9 @@ function getReportSummary(shopId) {
   const totalRevenue = bills.reduce((acc, b) => acc + b.grandTotal, 0);
   const totalDue = bills.reduce((acc, b) => acc + b.dueAmount, 0);
   return { farmerCount: farmers.length, billCount: bills.length, totalRevenue, totalDue };
+
+function getLedger(shopId, farmerId, year) {
+  return db.yearlyLedgers.find((l) => l.shopId === shopId && l.farmerId === farmerId && l.year === year) || null;
 }
 
 module.exports = {
@@ -141,6 +244,10 @@ module.exports = {
   listFarmersByShop,
   createFarmer,
   getFarmerById,
+  listFarmersByShop,
+  createFarmer,
+  getFarmerById,
+  getShop,
   listProductsByShop,
   createProduct,
   getProductById,
@@ -152,4 +259,5 @@ module.exports = {
   upsertLedger,
   getLedger,
   getReportSummary
+  getLedger
 };
