@@ -1,6 +1,9 @@
 const http = require('http');
 const { parse: parseUrl } = require('url');
 const {
+  listShops,
+  createShop,
+  updateShopStatus,
   listFarmersByShop,
   createFarmer,
   getShop,
@@ -14,6 +17,10 @@ const {
   createBill,
   listBillsByShop,
   upsertLedger,
+  getLedger,
+  getSubscriptionByShop,
+  updateSubscriptionByWebhook,
+  getReportSummary
   getLedger
 } = require('./models/store');
 const { sendJson, parseJson } = require('./utils/http');
@@ -33,6 +40,15 @@ function authenticate(req) {
   return { ok: true, user: parsed.payload };
 }
 
+function requireRole(user, role) {
+  if (user.role !== role) return { ok: false, status: 403, message: `Requires role ${role}` };
+  return { ok: true };
+}
+
+function tenantGuard(user, shopIdFromPath) {
+  if (user.role === 'master_admin') return { ok: true };
+  if (!user.shopId) return { ok: false, status: 403, message: 'Tenant context missing' };
+  if (shopIdFromPath && user.shopId !== shopIdFromPath) return { ok: false, status: 403, message: 'Cross-tenant access denied' };
 function tenantGuard(user, shopIdFromPath) {
   if (user.role === 'master_admin') return { ok: true };
   if (!user.shopId) return { ok: false, status: 403, message: 'Tenant context missing' };
@@ -47,6 +63,8 @@ function subscriptionGuard(user, method) {
   const shop = getShop(user.shopId);
   if (!shop) return { ok: false, status: 403, message: 'Shop not found' };
   const writeMethod = ['POST', 'PUT', 'PATCH', 'DELETE'].includes(method);
+  if (writeMethod && shop.status === 'expired') return { ok: false, status: 402, message: 'Subscription expired' };
+  if (writeMethod && shop.status === 'grace') return { ok: true, warning: 'Shop is in grace period' };
   if (writeMethod && shop.status === 'expired') {
     return { ok: false, status: 402, message: 'Subscription expired' };
   }
@@ -93,6 +111,9 @@ function validateBillPayload(payload) {
 function createApp() {
   return http.createServer(async (req, res) => {
     const requestId = require('crypto').randomUUID();
+    const path = parseUrl(req.url, true).pathname;
+
+    if (req.method === 'GET' && path === '/health') return sendJson(res, 200, { ok: true, requestId });
     const parsed = parseUrl(req.url, true);
     const path = parsed.pathname;
 
@@ -106,6 +127,7 @@ function createApp() {
         const result = login(body.email, body.password);
         if (!result) return sendJson(res, 401, { error: 'Invalid credentials', requestId });
         return sendJson(res, 200, { ...result, requestId });
+      } catch { return sendJson(res, 400, { error: 'Invalid JSON', requestId }); }
       } catch {
         return sendJson(res, 400, { error: 'Invalid JSON', requestId });
       }
@@ -117,6 +139,58 @@ function createApp() {
         const result = refresh(body.refreshToken);
         if (!result) return sendJson(res, 401, { error: 'Invalid refresh token', requestId });
         return sendJson(res, 200, { ...result, requestId });
+      } catch { return sendJson(res, 400, { error: 'Invalid JSON', requestId }); }
+    }
+
+    if (req.method === 'GET' && path === '/api/subscriptions/me') {
+      const secured = withAuthAndGuards(req, requestId);
+      if (secured.error) return sendJson(res, secured.error.status, secured.error.body);
+      const sub = getSubscriptionByShop(secured.user.shopId);
+      return sendJson(res, 200, { data: sub, requestId });
+    }
+
+    if (req.method === 'POST' && path === '/api/subscriptions/webhook') {
+      try {
+        const body = await parseJson(req);
+        const updated = updateSubscriptionByWebhook(body);
+        if (!updated) return sendJson(res, 404, { error: 'Subscription not found', requestId });
+        return sendJson(res, 200, { data: updated, requestId });
+      } catch { return sendJson(res, 400, { error: 'Invalid JSON', requestId }); }
+    }
+
+    if (req.method === 'GET' && path === '/api/admin/shops') {
+      const auth = authenticate(req);
+      if (!auth.ok) return sendJson(res, auth.status, { error: auth.message, requestId });
+      const role = requireRole(auth.user, 'master_admin');
+      if (!role.ok) return sendJson(res, role.status, { error: role.message, requestId });
+      return sendJson(res, 200, { data: listShops(), requestId });
+    }
+
+    if (req.method === 'POST' && path === '/api/admin/shops') {
+      const auth = authenticate(req);
+      if (!auth.ok) return sendJson(res, auth.status, { error: auth.message, requestId });
+      const role = requireRole(auth.user, 'master_admin');
+      if (!role.ok) return sendJson(res, role.status, { error: role.message, requestId });
+      try {
+        const body = await parseJson(req);
+        if (!body?.name || !body?.ownerName || !body?.phone) return sendJson(res, 400, { error: 'name, ownerName, phone required', requestId });
+        return sendJson(res, 201, { data: createShop(body), requestId });
+      } catch { return sendJson(res, 400, { error: 'Invalid JSON', requestId }); }
+    }
+
+    const shopStatusMatch = path.match(/^\/api\/admin\/shops\/([^/]+)\/status$/);
+    if (shopStatusMatch && req.method === 'PATCH') {
+      const auth = authenticate(req);
+      if (!auth.ok) return sendJson(res, auth.status, { error: auth.message, requestId });
+      const role = requireRole(auth.user, 'master_admin');
+      if (!role.ok) return sendJson(res, role.status, { error: role.message, requestId });
+      try {
+        const body = await parseJson(req);
+        if (!['active', 'grace', 'expired'].includes(body.status)) return sendJson(res, 400, { error: 'invalid status', requestId });
+        const updated = updateShopStatus(shopStatusMatch[1], body.status);
+        if (!updated) return sendJson(res, 404, { error: 'Shop not found', requestId });
+        return sendJson(res, 200, { data: updated, requestId });
+      } catch { return sendJson(res, 400, { error: 'Invalid JSON', requestId }); }
       } catch {
         return sendJson(res, 400, { error: 'Invalid JSON', requestId });
       }
@@ -138,6 +212,9 @@ function createApp() {
         const body = await parseJson(req);
         const validation = validateFarmerPayload(body);
         if (validation) return sendJson(res, 400, { error: validation, requestId });
+        const headers = writeGuard.warning ? { 'X-Subscription-Warning': writeGuard.warning } : {};
+        return sendJson(res, 201, { data: createFarmer(secured.user.shopId, body), requestId }, headers);
+      } catch { return sendJson(res, 400, { error: 'Invalid JSON', requestId }); }
         const farmer = createFarmer(secured.user.shopId, body);
         const headers = writeGuard.warning ? { 'X-Subscription-Warning': writeGuard.warning } : {};
         return sendJson(res, 201, { data: farmer, requestId }, headers);
@@ -161,6 +238,9 @@ function createApp() {
         const body = await parseJson(req);
         const validation = validateProductPayload(body);
         if (validation) return sendJson(res, 400, { error: validation, requestId });
+        const headers = writeGuard.warning ? { 'X-Subscription-Warning': writeGuard.warning } : {};
+        return sendJson(res, 201, { data: createProduct(secured.user.shopId, body), requestId }, headers);
+      } catch { return sendJson(res, 400, { error: 'Invalid JSON', requestId }); }
         const product = createProduct(secured.user.shopId, body);
         const headers = writeGuard.warning ? { 'X-Subscription-Warning': writeGuard.warning } : {};
         return sendJson(res, 201, { data: product, requestId }, headers);
@@ -206,6 +286,9 @@ function createApp() {
           if (!product || !batch) return sendJson(res, 400, { error: 'Product and batch must belong to tenant', requestId });
           if (batch.productId !== product.id) return sendJson(res, 400, { error: 'Batch does not belong to product', requestId });
           if (batch.remainingQty < qty) return sendJson(res, 400, { error: 'Insufficient stock', requestId });
+          const rate = Number(item.rate || product.rate);
+          const amount = qty * rate;
+          items.push({ productId: product.id, batchId: batch.id, qty, rate, amount });
 
           const rate = Number(item.rate || product.rate);
           const amount = qty * rate;
@@ -224,6 +307,12 @@ function createApp() {
         const paidAmount = Number(body.paidAmount || 0);
         const grandTotal = subtotal - discount;
         const dueAmount = grandTotal - paidAmount;
+        if (dueAmount > 0 && !body.signatureImageUrl) return sendJson(res, 400, { error: 'Signature required for credit bill', requestId });
+
+        for (const item of items) getBatchById(secured.user.shopId, item.batchId).remainingQty -= item.qty;
+
+        const bill = createBill(secured.user.shopId, {
+          invoiceNumber: nextInvoiceNumber(secured.user.shopId),
 
         if (dueAmount > 0 && !body.signatureImageUrl) {
           return sendJson(res, 400, { error: 'Signature required for credit bill', requestId });
@@ -249,6 +338,10 @@ function createApp() {
           createdBy: secured.user.userId,
           createdAt: new Date().toISOString()
         });
+        const ledger = upsertLedger(secured.user.shopId, farmer.id, grandTotal, paidAmount);
+        const headers = writeGuard.warning ? { 'X-Subscription-Warning': writeGuard.warning } : {};
+        return sendJson(res, 201, { data: bill, ledger, requestId }, headers);
+      } catch { return sendJson(res, 400, { error: 'Invalid JSON', requestId }); }
 
         const ledger = upsertLedger(secured.user.shopId, farmer.id, grandTotal, paidAmount);
 
@@ -263,6 +356,15 @@ function createApp() {
     if (ledgerMatch && req.method === 'GET') {
       const secured = withAuthAndGuards(req, requestId);
       if (secured.error) return sendJson(res, secured.error.status, secured.error.body);
+      const farmer = getFarmerById(secured.user.shopId, ledgerMatch[1]);
+      if (!farmer) return sendJson(res, 404, { error: 'Farmer not found', requestId });
+      return sendJson(res, 200, { data: getLedger(secured.user.shopId, ledgerMatch[1], Number(ledgerMatch[2])), requestId });
+    }
+
+    if (path === '/api/reports/summary' && req.method === 'GET') {
+      const secured = withAuthAndGuards(req, requestId);
+      if (secured.error) return sendJson(res, secured.error.status, secured.error.body);
+      return sendJson(res, 200, { data: getReportSummary(secured.user.shopId), requestId });
       const farmerId = ledgerMatch[1];
       const year = Number(ledgerMatch[2]);
       const farmer = getFarmerById(secured.user.shopId, farmerId);
@@ -273,6 +375,11 @@ function createApp() {
 
     const matchAdminShopFarmers = path.match(/^\/api\/admin\/shops\/([^/]+)\/farmers$/);
     if (matchAdminShopFarmers && req.method === 'GET') {
+      const auth = authenticate(req);
+      if (!auth.ok) return sendJson(res, auth.status, { error: auth.message, requestId });
+      const tenant = tenantGuard(auth.user, matchAdminShopFarmers[1]);
+      if (!tenant.ok) return sendJson(res, tenant.status, { error: tenant.message, requestId });
+      return sendJson(res, 200, { data: listFarmersByShop(matchAdminShopFarmers[1]), requestId });
       const shopId = matchAdminShopFarmers[1];
       const auth = authenticate(req);
       if (!auth.ok) return sendJson(res, auth.status, { error: auth.message, requestId });
